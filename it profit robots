@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# profit_worker_final.py - Self-healing, cross‑promoting, target‑locked worker
+
+import os
+import sys
+import json
+import time
+import random
+import hashlib
+import datetime
+import sqlite3
+import feedparser
+import requests
+
+# ========== CONFIGURATION (from GitHub Secrets) ==========
+FB_TOKEN = os.getenv("FB_ACCESS_TOKEN")
+PEXELS_KEY = os.getenv("PEXELS_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+CENTRAL_FB_PAGE = os.getenv("CENTRAL_FB_PAGE_ID")
+BITLY_TOKEN = os.getenv("BITLY_ACCESS_TOKEN")
+
+# ===== CHANGE THIS to your actual GitHub Pages URL =====
+BASE_URL = "https://YOUR_USERNAME.github.io/YOUR_REPO_NAME/"
+# ========================================================
+
+CLICKS_TARGET = 300          # 300 clicks = $30 at $0.10 CPC
+CPC_ESTIMATE = 0.10
+MAX_REPOSTS = 10
+
+DELAY = (2, 5)                     # random sleep between API calls
+FALLBACK_IMAGE = "https://images.pexels.com/photos/265087/pexels-photo-265087.jpeg"
+
+DB_PATH = "worker_state.db"
+EARN_DB = "earnings_tracker.db"
+
+# ---------- Retry decorator ----------
+def retry(max_attempts=3, delay=2):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"Attempt {attempt+1} failed: {e}")
+                    time.sleep(delay * (2 ** attempt))
+            return None
+        return wrapper
+    return decorator
+
+# ---------- Database initialisation ----------
+def init_dbs():
+    for db in [DB_PATH, EARN_DB]:
+        conn = sqlite3.connect(db)
+        c = conn.cursor()
+        if db == DB_PATH:
+            c.execute('''CREATE TABLE IF NOT EXISTS posted_today (niche_id TEXT PRIMARY KEY, date TEXT)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS repost_count (niche_id TEXT, month TEXT, count INTEGER, PRIMARY KEY (niche_id, month))''')
+        else:
+            c.execute('''CREATE TABLE IF NOT EXISTS monthly_earnings
+                         (niche_id TEXT, month TEXT, target REAL, earned REAL,
+                          status TEXT, points INTEGER, last_short_url TEXT,
+                          PRIMARY KEY (niche_id, month))''')
+        conn.commit()
+        conn.close()
+
+def already_posted_today(niche_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.date.today().isoformat()
+    c.execute("SELECT 1 FROM posted_today WHERE niche_id=? AND date=?", (niche_id, today))
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
+def mark_posted_today(niche_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.date.today().isoformat()
+    c.execute("INSERT OR REPLACE INTO posted_today VALUES (?, ?)", (niche_id, today))
+    conn.commit()
+    conn.close()
+
+def get_repost_count(niche_id):
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT count FROM repost_count WHERE niche_id=? AND month=?", (niche_id, month))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def increment_repost_count(niche_id):
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO repost_count (niche_id, month, count) VALUES (?, ?, 1) ON CONFLICT(niche_id, month) DO UPDATE SET count = count + 1", (niche_id, month))
+    conn.commit()
+    conn.close()
+
+def update_short_url(niche_id, short_url):
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(EARN_DB)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO monthly_earnings (niche_id, month, target, earned, status, points, last_short_url) VALUES (?, ?, 30.0, 0, 'pending', 0, ?)",
+              (niche_id, month, short_url))
+    conn.commit()
+    conn.close()
+
+def get_underperforming_niche(exclude_niche_id):
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(EARN_DB)
+    c = conn.cursor()
+    c.execute("SELECT niche_id FROM monthly_earnings WHERE month=? AND earned < 30 AND niche_id != ?", (month, exclude_niche_id))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return None
+    valid = []
+    for (nid,) in rows:
+        if get_repost_count(nid) < MAX_REPOSTS:
+            valid.append(nid)
+    if not valid:
+        return None
+    return random.choice(valid)
+
+def get_last_short_url(niche_id):
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(EARN_DB)
+    c = conn.cursor()
+    c.execute("SELECT last_short_url FROM monthly_earnings WHERE niche_id=? AND month=?", (niche_id, month))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ---------- Bitly shortening ----------
+def shorten_link(long_url):
+    if not BITLY_TOKEN:
+        return long_url
+    bitly_api = "https://api-ssl.bitly.com/v4/shorten"
+    headers = {"Authorization": f"Bearer {BITLY_TOKEN}", "Content-Type": "application/json"}
+    payload = {"long_url": long_url, "domain": "bit.ly"}
+    try:
+        resp = requests.post(bitly_api, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()["link"]
+    except Exception as e:
+        print(f"Bitly shorten error: {e}")
+    return long_url
+
+# ---------- Niche loading ----------
+def load_niche(niche_id):
+    try:
+        with open("profitable_niches.json", "r") as f:
+            data = json.load(f)
+            for n in data.get("niches", []):
+                if n["id"] == niche_id:
+                    return n
+    except Exception as e:
+        print(f"Load niche error: {e}")
+    return None
+
+# ---------- Core functions with retries ----------
+@retry(max_attempts=3, delay=2)
+def fetch_trend(niche):
+    kw = niche["keywords"][0]
+    rss_url = f"https://news.google.com/rss/search?q={kw.replace(' ', '+')}&hl=en&gl=US"
+    feed = feedparser.parse(rss_url)
+    if feed.entries:
+        return feed.entries[0].title, feed.entries[0].link
+    raise Exception("No RSS entries")
+
+@retry(max_attempts=3, delay=3)
+def generate_ai_text(topic, niche):
+    api_url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    prompt = f"Write a short blog post (max 120 words) about {niche['keywords'][0]}. Topic: {topic}. Plain text."
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 180}}
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+    if resp.status_code == 200:
+        result = resp.json()
+        if result and 'generated_text' in result[0]:
+            return result[0]['generated_text'].strip()
+    raise Exception(f"HF error {resp.status_code}")
+
+@retry(max_attempts=2, delay=1)
+def fetch_image(niche):
+    kw = niche["keywords"][0].split()[0]
+    url = f"https://api.pexels.com/v1/search?query={kw}+business&per_page=1"
+    headers = {"Authorization": PEXELS_KEY}
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code == 200 and resp.json().get("photos"):
+        return resp.json()["photos"][0]["src"]["medium"]
+    raise Exception("No image")
+
+def publish_github(title, content, img_url, niche, recommendation_url=None):
+    folder = niche["folder"]
+    date_str = datetime.date.today().isoformat()
+    slug = hashlib.md5(f"{niche['id']}{title}".encode()).hexdigest()[:10]
+    os.makedirs(f"_posts/{folder}", exist_ok=True)
+    filename = f"_posts/{folder}/{date_str}-{slug}.md"
+    if recommendation_url:
+        content += f"\n\n👉 **Recommended for you:** [Click here]({recommendation_url})"
+    md = f"""---
+title: "{title}"
+date: {date_str}
+niche: {niche['id']}
+image: {img_url}
+---
+
+![Image]({img_url})
+
+{content}
+
+---
+*Auto-generated by Profit Robot – self‑optimizing swarm*
+"""
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(md)
+    post_url = f"{BASE_URL}_posts/{folder}/{date_str}-{slug}.html"
+    return post_url
+
+def publish_facebook(msg, img_url, niche, recommendation_url=None):
+    if not FB_TOKEN or not CENTRAL_FB_PAGE:
+        return False
+    if recommendation_url:
+        msg += f"\n\n👉 Recommended: {recommendation_url}"
+    hashtag = niche["keywords"][0].replace(" ", "").replace("-", "")
+    full_msg = f"{msg}\n\n#{hashtag} #ProfitRobot"[:1000]
+    img_data = requests.get(img_url, timeout=15).content
+    url = f"https://graph.facebook.com/{CENTRAL_FB_PAGE}/photos"
+    files = {"source": img_data}
+    data = {"caption": full_msg, "access_token": FB_TOKEN}
+    resp = requests.post(url, files=files, data=data, timeout=30)
+    return resp.status_code == 200
+
+def random_sleep():
+    time.sleep(random.uniform(*DELAY))
+
+# ---------- Main ----------
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python profit_worker_final.py <niche_id> [force]")
+        sys.exit(1)
+    niche_id = sys.argv[1]
+    force = len(sys.argv) > 2 and sys.argv[2] == "force"
+
+    init_dbs()
+
+    if not force and already_posted_today(niche_id):
+        print(f"⏭️ {niche_id} already posted today")
+        return
+    if not force:
+        repost_count = get_repost_count(niche_id)
+        if repost_count >= MAX_REPOSTS:
+            print(f"💰 {niche_id} reached max reposts ({MAX_REPOSTS}) – stopping")
+            return
+
+    niche = load_niche(niche_id)
+    if not niche:
+        print(f"❌ Niche {niche_id} not found")
+        return
+
+    # 1. Get trending title
+    try:
+        title, link = fetch_trend(niche)
+    except Exception as e:
+        title = f"Latest {niche['keywords'][0]} update – {datetime.date.today()}"
+        print(f"Using fallback title: {title}")
+
+    # 2. Generate AI text
+    random_sleep()
+    try:
+        text = generate_ai_text(title, niche)
+    except Exception as e:
+        text = f"💰 {title}\n\nDiscover the best {niche['keywords'][0]} options. High ROI opportunity!"
+        print(f"Using fallback text: {text[:50]}...")
+
+    # 3. Fetch image
+    random_sleep()
+    try:
+        img_url = fetch_image(niche)
+    except Exception as e:
+        img_url = FALLBACK_IMAGE
+        print("Using fallback image")
+
+    # 4. Cross-robot recommendation
+    recommendation = None
+    lagging = get_underperforming_niche(niche_id)
+    if lagging:
+        short = get_last_short_url(lagging)
+        if not short:
+            folder_link = f"{BASE_URL}_posts/{lagging.split('_')[1] if '_' in lagging else lagging}/"
+            short = shorten_link(folder_link)
+        recommendation = short
+        print(f"🔗 Recommending underperforming niche: {lagging} -> {short}")
+
+    # 5. Publish to GitHub
+    random_sleep()
+    post_url = publish_github(title, text, img_url, niche, recommendation)
+    print(f"✅ GitHub: {post_url}")
+
+    # 6. Shorten own URL and store
+    own_short = shorten_link(post_url)
+    update_short_url(niche_id, own_short)
+
+    # 7. Publish to Facebook
+    random_sleep()
+    fb_ok = publish_facebook(text, img_url, niche, recommendation)
+    print(f"📘 Facebook: {'OK' if fb_ok else 'FAIL (ignored)'}")
+
+    # 8. Mark as posted
+    mark_posted_today(niche_id)
+    if force:
+        increment_repost_count(niche_id)
+
+    print(f"✅ Worker {niche_id} completed. Short URL: {own_short}")
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# repair_scheduler_final.py - Daily repair: trigger reposts for lagging niches
+
+import datetime
+import sqlite3
+import subprocess
+import time
+
+DB_PATH = "worker_state.db"
+MAX_REPOSTS = 10
+
+def get_stalled_niches():
+    month = datetime.date.today().strftime("%Y-%m")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT niche_id, count FROM repost_count WHERE month=? AND count < ?", (month, MAX_REPOSTS))
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+def trigger_repost(niche_id):
+    subprocess.run(["python", "profit_worker_final.py", niche_id, "force"])
+    time.sleep(60)   # avoid hitting rate limits
+
+def main():
+    stalled = get_stalled_niches()
+    if not stalled:
+        print("No stalled niches found.")
+        return
+    print(f"Found {len(stalled)} niches that need reposts.")
+    for n in stalled:
+        print(f"🔁 Triggering repost for {n}")
+        trigger_repost(n)
+
+if __name__ == "__main__":
+    main()
+feedparser==6.0.10
+requests==2.31.0
